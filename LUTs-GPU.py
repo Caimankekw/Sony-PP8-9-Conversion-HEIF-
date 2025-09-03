@@ -1,41 +1,66 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-slog3_heif_to_jpeg_lut.py (lean)
----------------------------------
+slog3_heif_to_jpeg_lut.py (CuPy accelerated)
+--------------------------------------------
 Batch convert Sony HIF/HEIF (PP8 S-Log3 + S-Gamut3.Cine) to sRGB JPEG via a selected .cube 3D LUT.
 
-Defaults:
-  - Input images from ./input/
-  - Output JPEGs to ./output/
-  - LUTs (.cube) from ./LUTs/
-
-Flow:
-  - List .cube LUTs in LUTs folder -> pick one (or use --lut-index)
-  - Ask EV interactively (overrides CLI default)
-  - Decode image -> Pre-LUT exposure in S-Log3 linear -> LUT (tri-linear) -> sRGB JPEG
-  - Filename tagged with date + LUT + EV
-
-Install:
-  pip install pillow-heif Pillow numpy
-  (optional) pip install piexif
+GPU policy:
+- All math runs on GPU via CuPy when available.
+- Pillow/pillow-heif stay on CPU; we convert arrays at the edges via to_gpu()/to_cpu().
 """
 
 from __future__ import annotations
 from pathlib import Path
 import sys, datetime, argparse
-import numpy as np
-from PIL import Image
 
+# ---------- CPU/GPU unification ----------
+try:
+    import cupy as cp
+    _GPU = True
+except Exception:
+    cp = None
+    _GPU = False
+
+import numpy as _np  # always-available NumPy for I/O (Pillow, file parsing)
+xp = cp if _GPU else _np
+
+from PIL import Image
 try:
     import pillow_heif
 except Exception:
     pillow_heif = None
 
+# ---------- bridge helpers ----------
+def to_gpu(a):
+    """Move array to GPU (CuPy) if available; else return as-is."""
+    if _GPU:
+        try:
+            if isinstance(a, cp.ndarray):
+                return a
+            return cp.asarray(a)
+        except Exception:
+            return a
+    return a
+
+def to_cpu(a):
+    """Move array to CPU (NumPy). Robust to cp.ndarray and cuda-aware arrays."""
+    if _GPU:
+        try:
+            if isinstance(a, cp.ndarray):
+                return cp.asnumpy(a)
+        except Exception:
+            pass
+        # Objects with __cuda_array_interface__ but not cp.ndarray
+        try:
+            return _np.array(a)  # best-effort fallback
+        except Exception:
+            return a
+    return a
+
 # -------------------------------
 # S-Log3 <-> linear (Sony PP8)
 # -------------------------------
-
 def _slog3_break_and_intercept():
     C1 = 0.01125000
     C2 = 0.037584
@@ -43,53 +68,53 @@ def _slog3_break_and_intercept():
     B  = 0.616596
     E  = 0.03
     F  = 3.53881278538813
-    S_break = A * np.log10(C1 + C2) + B + E
+    # compute with CPU float to avoid dtype surprises
+    S_break = A * _np.log10(C1 + C2) + B + E
     intercept = S_break - F * C1
     return C1, C2, A, B, E, F, float(S_break), float(intercept)
 
 _C1, _C2, _A, _B, _E, _F, _S_BREAK, _INTERCEPT = _slog3_break_and_intercept()
 
-def slog3_to_linear(x: np.ndarray) -> np.ndarray:
-    x = x.astype(np.float32)
+def slog3_to_linear(x):
+    x = x.astype(xp.float32)
     high = x >= _S_BREAK
-    y = np.empty_like(x, dtype=np.float32)
-    y[high]  = np.power(10.0, (x[high] - _B - _E) / _A) - _C2
+    y = xp.empty_like(x, dtype=xp.float32)
+    y[high]  = xp.power(10.0, (x[high] - _B - _E) / _A) - _C2
     y[~high] = (x[~high] - _INTERCEPT) / _F
     return y
 
-def linear_to_slog3(y: np.ndarray) -> np.ndarray:
-    y = y.astype(np.float32)
+def linear_to_slog3(y):
+    y = y.astype(xp.float32)
     high = y >= _C1
-    x = np.empty_like(y, dtype=np.float32)
-    x[high]  = _A * np.log10(np.maximum(y[high] + _C2, 1e-10)) + _B + _E
+    x = xp.empty_like(y, dtype=xp.float32)
+    x[high]  = _A * xp.log10(xp.maximum(y[high] + _C2, 1e-10)) + _B + _E
     x[~high] = _F * y[~high] + _INTERCEPT
     return x
 
 # -------------------------------
 # sRGB OETF
 # -------------------------------
-
-def srgb_oetf(linear: np.ndarray) -> np.ndarray:
+def srgb_oetf(linear):
     a = 0.055
-    linear = np.clip(linear, 0.0, 1.0).astype(np.float32)
+    linear = xp.clip(linear.astype(xp.float32), 0.0, 1.0)
     low = linear <= 0.0031308
-    out = np.empty_like(linear, dtype=np.float32)
+    out = xp.empty_like(linear, dtype=xp.float32)
     out[low]  = 12.92 * linear[low]
-    out[~low] = (1 + a) * np.power(linear[~low], 1/2.4) - a
+    out[~low] = (1 + a) * xp.power(linear[~low], 1/2.4) - a
     return out
 
 # -------------------------------
 # .cube LUT (3D) parsing + tri-linear
 # -------------------------------
-
 class CubeLUT3D:
-    def __init__(self, size: int, table: np.ndarray, domain_min=None, domain_max=None):
+    def __init__(self, size: int, table, domain_min=None, domain_max=None):
         self.size = int(size)
-        self.table = np.asarray(table, dtype=np.float32)
+        # table expected on GPU for fast sampling
+        self.table = to_gpu(table).astype(xp.float32, copy=False)
         if self.table.shape != (self.size, self.size, self.size, 3):
             raise ValueError("LUT table shape mismatch.")
-        self.domain_min = np.array([0.0, 0.0, 0.0], dtype=np.float32) if domain_min is None else np.asarray(domain_min, dtype=np.float32)
-        self.domain_max = np.array([1.0, 1.0, 1.0], dtype=np.float32) if domain_max is None else np.asarray(domain_max, dtype=np.float32)
+        self.domain_min = to_gpu(_np.array([0.0, 0.0, 0.0], dtype=_np.float32) if domain_min is None else _np.asarray(domain_min, dtype=_np.float32))
+        self.domain_max = to_gpu(_np.array([1.0, 1.0, 1.0], dtype=_np.float32) if domain_max is None else _np.asarray(domain_max, dtype=_np.float32))
 
     @staticmethod
     def from_cube_file(path: Path) -> "CubeLUT3D":
@@ -106,9 +131,9 @@ class CubeLUT3D:
                 elif key == 'LUT_3D_SIZE':
                     size = int(toks[1])
                 elif key == 'DOMAIN_MIN':
-                    domain_min = np.array(list(map(float, toks[1:4])), dtype=np.float32)
+                    domain_min = _np.array(list(map(float, toks[1:4])), dtype=_np.float32)
                 elif key == 'DOMAIN_MAX':
-                    domain_max = np.array(list(map(float, toks[1:4])), dtype=np.float32)
+                    domain_max = _np.array(list(map(float, toks[1:4])), dtype=_np.float32)
                 elif key.startswith('LUT_1D_SIZE') or key.startswith('LUT_2D_SIZE'):
                     raise ValueError("Only 3D LUTs are supported.")
                 else:
@@ -123,51 +148,54 @@ class CubeLUT3D:
         expected = size * size * size
         if len(data) != expected:
             raise ValueError(f".cube data length {len(data)} != expected {expected}")
-        # Raw reshape as-read -> (B,G,R,3) in typical files where R runs fastest (most common)
-        table = np.array(data, dtype=np.float32).reshape((size, size, size, 3))
-        return CubeLUT3D(size=size, table=table, domain_min=domain_min, domain_max=domain_max)
+        # build on CPU, then move to GPU
+        table_np = _np.array(data, dtype=_np.float32).reshape((size, size, size, 3))
+        return CubeLUT3D(size=size, table=table_np, domain_min=domain_min, domain_max=domain_max)
 
     def to_axes_rgb_inplace(self, scan_order: str = 'r_g_b'):
         """
         Canonicalize axes to [R,G,B] so we can index table[r,g,b].
         scan_order:
-          - 'r_g_b' (DEFAULT/common): file loops B outer, G middle, R inner (R fastest).
-            Our raw shape is (B,G,R,3) -> transpose (2,1,0,3) to (R,G,B,3).
-          - 'b_g_r': file already loops R outer, G middle, B inner (B fastest) -> raw is (R,G,B,3).
+          - 'r_g_b' (DEFAULT/common): raw is (B,G,R,3) -> transpose to (R,G,B,3).
+          - 'b_g_r': raw already (R,G,B,3).
         """
         if scan_order == 'r_g_b':
-            self.table = np.transpose(self.table, (2,1,0,3))
+            self.table = xp.transpose(self.table, (2,1,0,3))
         elif scan_order == 'b_g_r':
             pass
         else:
             raise ValueError("scan_order must be 'r_g_b' or 'b_g_r'.")
 
-    def apply(self, img: np.ndarray) -> np.ndarray:
+    def apply(self, img):
         """
-        Tri-linear sample.
-        Assumes self.table is already shaped [R,G,B,3] and input img is float32 RGB in [0,1].
+        Tri-linear sample on GPU.
+        Assumes self.table is [R,G,B,3] and input img is float32 RGB in [0,1] (GPU array).
         """
+        img = img.astype(xp.float32, copy=False)
         H, W, C = img.shape
         assert C == 3
-        out = np.empty_like(img, dtype=np.float32)
 
         dmin = self.domain_min
         dmax = self.domain_max
         size = self.size
-        scale = (size - 1.0) / np.maximum(dmax - dmin, 1e-12)
+        scale = (size - 1.0) / xp.maximum(dmax - dmin, 1e-12)
         table = self.table
 
-        for y0 in range(0, H, 512):
-            y1 = min(H, y0 + 512)
+        out = xp.empty_like(img, dtype=xp.float32)
+
+        # process by rows to control temp memory; 512 is a decent default
+        step = 512
+        for y0 in range(0, H, step):
+            y1 = min(H, y0 + step)
             block = img[y0:y1].reshape(-1, 3)
-            uvw = (np.clip(block, 0.0, 1.0) - dmin) * scale  # in [0, size-1]
-            i0 = np.floor(uvw).astype(np.int32)
+            uvw = (xp.clip(block, 0.0, 1.0) - dmin) * scale  # [0, size-1]
+            i0 = xp.floor(uvw).astype(xp.int32)
             f  = uvw - i0
-            i1 = np.minimum(i0 + 1, size - 1)
+            i1 = xp.minimum(i0 + 1, size - 1)
 
             iu0, iv0, iw0 = i0[:,0], i0[:,1], i0[:,2]
             iu1, iv1, iw1 = i1[:,0], i1[:,1], i1[:,2]
-            fu, fv, fw = f[:,0:1], f[:,1:2], f[:,2:3]
+            fu,  fv,  fw  = f[:,0:1], f[:,1:2], f[:,2:3]
 
             c000 = table[iu0,iv0,iw0]
             c100 = table[iu1,iv0,iw0]
@@ -193,20 +221,22 @@ class CubeLUT3D:
 # -------------------------------
 # I/O helpers
 # -------------------------------
-
-def read_image_as_float(path: Path) -> tuple[np.ndarray, dict]:
-    """Decode HIF/HEIF/HEIC/JPG/PNG as float32 [0..1]."""
+def read_image_as_float(path: Path):
+    """Decode HIF/HEIF/HEIC/JPG/PNG as float32 [0..1] on CPU, then move to GPU."""
     if path.suffix.lower() in (".hif", ".heif", ".heic"):
         if pillow_heif is None:
             raise RuntimeError("pillow-heif is required for HEIF. pip install pillow-heif")
         pillow_heif.register_heif_opener()
     img = Image.open(path).convert("RGB")
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    return arr, (getattr(img, "info", {}) or {})
+    arr = _np.asarray(img, dtype=_np.float32) / 255.0  # stay CPU
+    return to_gpu(arr), (getattr(img, "info", {}) or {})
 
-def save_jpeg(path: Path, rgb: np.ndarray, quality: int = 95, exif: bytes | None = None):
-    """Save sRGB JPEG; keep EXIF if not oversized, else trim/drop."""
-    img = Image.fromarray((np.clip(rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8), mode="RGB")
+def save_jpeg(path: Path, rgb, quality: int = 100, exif: bytes | None = None):
+    """Save sRGB JPEG; ensure CPU uint8 for Pillow."""
+    arr = xp.clip(rgb.astype(xp.float32), 0.0, 1.0)
+    u8 = (xp.rint(arr * 255.0)).astype(xp.uint8)
+    u8_cpu = to_cpu(u8)
+    img = Image.fromarray(u8_cpu, mode="RGB")
     kwargs = {"quality": int(quality), "subsampling": 0, "optimize": True}
     if exif:
         try:
@@ -233,7 +263,6 @@ def list_cube_files(luts_dir: Path) -> list[Path]:
 # -------------------------------
 # Minimal pipeline
 # -------------------------------
-
 def process_one(
     in_path: Path,
     out_dir: Path,
@@ -242,19 +271,19 @@ def process_one(
     quality: int,
     keep_exif: bool,
 ):
-    # 1) read
+    # 1) read (CPU) -> GPU
     rgb_log, info = read_image_as_float(in_path)
 
-    # 2) apply EV in S-Log3 linear (pre-LUT)
+    # 2) apply EV in S-Log3 linear (pre-LUT) on GPU
     lin = slog3_to_linear(rgb_log)
     if abs(ev) > 1e-8:
-        lin *= (2.0 ** ev)
-    rgb_pre_lut = np.clip(linear_to_slog3(lin), 0.0, 1.0)
+        lin = lin * (2.0 ** ev)
+    rgb_pre_lut = xp.clip(linear_to_slog3(lin), 0.0, 1.0)
 
-    # 3) LUT (assumed slog3->display), then clamp
-    rgb_disp = np.clip(lut.apply(rgb_pre_lut), 0.0, 1.0)
+    # 3) LUT (GPU), then clamp
+    rgb_disp = xp.clip(lut.apply(rgb_pre_lut), 0.0, 1.0)
 
-    # 4) save
+    # 4) save (CPU)
     today = datetime.date.today().isoformat()
     lut_tag = in_path.stem + "_" + today
     out_name = f"{lut_tag}_{Path(lut.__dict__.get('name','lut')).stem}_EV{ev:+.2f}.jpg"
@@ -266,13 +295,12 @@ def process_one(
 # -------------------------------
 # Main
 # -------------------------------
-
 def main():
-    ap = argparse.ArgumentParser(description="S-Log3 HEIF → sRGB JPEG via .cube LUT (lean)")
-    ap.add_argument("--input-dir",  type=Path, default=Path("./input"), help="Input folder (default ./input)")
-    ap.add_argument("--output-dir", type=Path, default=Path("./output"), help="Output folder (default ./output)")
+    ap = argparse.ArgumentParser(description="S-Log3 HEIF → sRGB JPEG via .cube LUT (CuPy)")
+    ap.add_argument("--input-dir",  type=Path, default=Path("./Input"), help="Input folder (default ./input)")
+    ap.add_argument("--output-dir", type=Path, default=Path("./Output"), help="Output folder (default ./output)")
     ap.add_argument("--luts-dir",   type=Path, default=Path("./LUTs"),  help="LUTs folder with .cube (default ./LUTs)")
-    ap.add_argument("--quality", type=int, default=95, help="JPEG quality (default 95)")
+    ap.add_argument("--quality", type=int, default=100, help="JPEG quality (default 100)")
     ap.add_argument("--keep-exif", action="store_true", help="Try to keep EXIF (oversize will be trimmed/dropped)")
     ap.add_argument("--recursive", action="store_true", help="Recurse input subfolders for images")
     ap.add_argument("--lut-index", type=int, default=None, help="Pick LUT by index instead of interactive choice")
@@ -346,6 +374,10 @@ def main():
 
     if not files:
         print(f"[WARN] No images found under {in_dir}"); sys.exit(0)
+
+    # optional: enable CuPy memory pool to reduce alloc/free overhead
+    if _GPU:
+        cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
 
     for f in files:
         try:
