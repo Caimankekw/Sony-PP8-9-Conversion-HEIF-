@@ -24,7 +24,7 @@ Workflow:
 from __future__ import annotations
 from pathlib import Path
 import sys, datetime, argparse
-import cupy as np
+import numpy as np
 from PIL import Image
 import pillow_heif
 
